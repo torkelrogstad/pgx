@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"math"
 	"os"
 	"reflect"
@@ -331,6 +332,49 @@ func TestConnQueryRowByteSlice(t *testing.T) {
 		err := db.QueryRow(`select E'\\xdeadbeef'::bytea`).Scan(&actual)
 		require.NoError(t, err)
 		require.EqualValues(t, expected, actual)
+	})
+}
+
+func TestConnQueryRowConstraintErrors(t *testing.T) {
+	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, db *sql.DB) {
+		_, err := db.Exec(`CREATE TEMPORARY TABLE defer_test (
+    	id TEXT PRIMARY KEY, 
+    	n INT NOT NULL, UNIQUE (n),
+    	UNIQUE (n) DEFERRABLE INITIALLY DEFERRED )`)
+		require.NoError(t, err)
+
+		_, err = db.Exec(`DROP FUNCTION IF EXISTS test_trigger CASCADE`)
+		require.NoError(t, err)
+
+		_, err = db.Exec(`CREATE FUNCTION test_trigger() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    BEGIN
+		IF new.n = 4 THEN
+			RAISE EXCEPTION 'n cant be 4!';
+		END IF;
+		RETURN new;
+	END$$`)
+		require.NoError(t, err)
+
+		_, err = db.Exec(`CREATE CONSTRAINT TRIGGER test 
+    	AFTER INSERT OR UPDATE ON defer_test
+    	DEFERRABLE INITIALLY DEFERRED 
+    	FOR EACH ROW
+    	EXECUTE FUNCTION test_trigger()`)
+		require.NoError(t, err)
+
+		_, err = db.Exec(`INSERT INTO defer_test (id, n) VALUES ('a', 1), ('b', 2), ('c', 3)`)
+		require.NoError(t, err)
+
+		row := db.QueryRow(`INSERT INTO defer_test (id, n) VALUES ('e', 4) RETURNING id`)
+		assert.Error(t, row.Err())
+
+		var id string
+		assert.Error(t, row.Scan(&id))
+		assert.Empty(t, id)
+
+		var pgErr *pgconn.PgError
+		require.True(t, errors.As(err, &pgErr))
+		assert.Equal(t, "n cant be 4", pgErr.Message)
 	})
 }
 
